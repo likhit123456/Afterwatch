@@ -19,11 +19,26 @@ stages:
 default:
   image: python:3.12-slim
 
+# pip cache lives inside the project dir so GitLab can cache it. Jobs that
+# install Python deps opt in via the .pip-cache template below.
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+
+.pip-cache:
+  cache:
+    key:
+      files:
+        - requirements.txt
+    paths:
+      - .cache/pip
+
 # --- verify -------------------------------------------------------------------
+# DevSecOps stage: VERIFY. Functional tests; must keep passing after any fix.
 tests:
+  extends: .pip-cache
   stage: verify
   before_script:
-    - pip install --no-cache-dir -r requirements.txt
+    - pip install -r requirements.txt
   script:
     - pytest -q
 
@@ -31,6 +46,7 @@ tests:
 # These templates add `sast` and `secret_detection` jobs automatically and write
 # reports CI surfaces in the MR security widget. SAST catches VULN-1, Secret
 # Detection catches VULN-3.
+# DevSecOps stage: SECURE (static analysis + secret detection).
 include:
   - template: Jobs/SAST.gitlab-ci.yml
   - template: Jobs/Secret-Detection.gitlab-ci.yml
@@ -42,6 +58,7 @@ secret_detection:
   stage: secure
 
 # --- package ------------------------------------------------------------------
+# DevSecOps stage: PACKAGE. Build and push the container image.
 build-image:
   stage: package
   image: docker:27
@@ -56,7 +73,9 @@ build-image:
     - docker push "$IMAGE"
 
 # --- deploy to staging (Cloud Run) -------------------------------------------
+# DevSecOps stage: RELEASE / CONFIGURE (staging environment on Cloud Run).
 # Needs these CI/CD variables: GCP_PROJECT, GCP_SA_KEY (JSON), GCP_REGION.
+# Exports STAGING_URL to later jobs via the dotenv report.
 deploy-staging:
   stage: deploy-staging
   image: google/cloud-sdk:slim
@@ -82,18 +101,29 @@ deploy-staging:
       dotenv: staging.env
 
 # --- the adversarial gate -----------------------------------------------------
+# DevSecOps stage: SECURE (dynamic / adversarial testing against staging).
+# `needs` with artifacts: true is what delivers the dotenv report, so
+# $STAGING_URL is only available because of the needs entry below.
 redteam:
+  extends: .pip-cache
   stage: attack
   needs:
     - job: deploy-staging
       artifacts: true
   before_script:
-    - pip install --no-cache-dir httpx
+    - pip install httpx==0.28.1
+    # Fail loudly if the dotenv hand-off did not deliver the URL.
+    - test -n "$STAGING_URL" || { echo "STAGING_URL missing from deploy-staging dotenv"; exit 1; }
   script:
     - python security/redteam.py --base-url "$STAGING_URL"
   # exit 1 here fails the stage and blocks deploy-prod automatically.
 
 # --- deploy to prod (only if the gate passed) --------------------------------
+# DevSecOps stage: RELEASE (production). Gating: this job has no `needs`, so it
+# waits for EVERY job in earlier stages (tests, scanners, build, staging, and
+# redteam). A failed redteam therefore blocks it. `rules` additionally limits it
+# to the default branch. Do not add `needs` here: that would let it start
+# without waiting for the other earlier-stage jobs.
 deploy-prod:
   stage: deploy-prod
   image: google/cloud-sdk:slim
