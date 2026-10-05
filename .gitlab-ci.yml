@@ -1,0 +1,116 @@
+# Red Gate :: deterministic DevSecOps spine
+#
+# The agents (Duo flow) do the reasoning - triage, fixes, audit trail. This
+# pipeline is the demoable backbone that always runs the same way:
+#
+#   verify -> secure (scan) -> package -> deploy-staging -> redteam GATE -> deploy-prod
+#
+# Promotion to prod is gated on the red-team job's exit code. If any planted
+# attack still works against staging, redteam exits 1 and deploy-prod never runs.
+
+stages:
+  - verify
+  - secure
+  - package
+  - deploy-staging
+  - attack
+  - deploy-prod
+
+default:
+  image: python:3.12-slim
+
+# --- verify -------------------------------------------------------------------
+tests:
+  stage: verify
+  before_script:
+    - pip install --no-cache-dir -r requirements.txt
+  script:
+    - pytest -q
+
+# --- secure (GitLab managed scanners) ----------------------------------------
+# These templates add `sast` and `secret_detection` jobs automatically and write
+# reports CI surfaces in the MR security widget. SAST catches VULN-1, Secret
+# Detection catches VULN-3.
+include:
+  - template: Jobs/SAST.gitlab-ci.yml
+  - template: Jobs/Secret-Detection.gitlab-ci.yml
+
+sast:
+  stage: secure
+
+secret_detection:
+  stage: secure
+
+# --- package ------------------------------------------------------------------
+build-image:
+  stage: package
+  image: docker:27
+  services:
+    - docker:27-dind
+  variables:
+    IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+  before_script:
+    - echo "$CI_REGISTRY_PASSWORD" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+  script:
+    - docker build -t "$IMAGE" .
+    - docker push "$IMAGE"
+
+# --- deploy to staging (Cloud Run) -------------------------------------------
+# Needs these CI/CD variables: GCP_PROJECT, GCP_SA_KEY (JSON), GCP_REGION.
+deploy-staging:
+  stage: deploy-staging
+  image: google/cloud-sdk:slim
+  variables:
+    IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+    SERVICE: red-gate-staging
+  before_script:
+    - echo "$GCP_SA_KEY" > /tmp/key.json
+    - gcloud auth activate-service-account --key-file=/tmp/key.json
+    - gcloud config set project "$GCP_PROJECT"
+  script:
+    - |
+      gcloud run deploy "$SERVICE" \
+        --image "$IMAGE" \
+        --region "$GCP_REGION" \
+        --platform managed \
+        --allow-unauthenticated \
+        --quiet
+    - STAGING_URL=$(gcloud run services describe "$SERVICE" --region "$GCP_REGION" --format='value(status.url)')
+    - echo "STAGING_URL=$STAGING_URL" > staging.env
+  artifacts:
+    reports:
+      dotenv: staging.env
+
+# --- the adversarial gate -----------------------------------------------------
+redteam:
+  stage: attack
+  needs:
+    - job: deploy-staging
+      artifacts: true
+  before_script:
+    - pip install --no-cache-dir httpx
+  script:
+    - python security/redteam.py --base-url "$STAGING_URL"
+  # exit 1 here fails the stage and blocks deploy-prod automatically.
+
+# --- deploy to prod (only if the gate passed) --------------------------------
+deploy-prod:
+  stage: deploy-prod
+  image: google/cloud-sdk:slim
+  variables:
+    IMAGE: $CI_REGISTRY_IMAGE:$CI_COMMIT_SHORT_SHA
+    SERVICE: red-gate-prod
+  before_script:
+    - echo "$GCP_SA_KEY" > /tmp/key.json
+    - gcloud auth activate-service-account --key-file=/tmp/key.json
+    - gcloud config set project "$GCP_PROJECT"
+  script:
+    - |
+      gcloud run deploy "$SERVICE" \
+        --image "$IMAGE" \
+        --region "$GCP_REGION" \
+        --platform managed \
+        --allow-unauthenticated \
+        --quiet
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
