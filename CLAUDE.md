@@ -26,7 +26,7 @@ production.
 | `tests/` | Functional tests (health, valid/invalid login) |
 | `security/redteam.py` | Adversarial gate. Attacks a deployed URL; exit 1 = breach, blocks promotion |
 | `.gitlab-ci.yml` | Pipeline: tests → sast/secret_detection → build-image → deploy-staging (Cloud Run) → redteam → deploy-prod (default branch only) |
-| `flows/` | GitLab Duo Agent Platform flow (agentic layer). Referenced in README, not yet present |
+| `flows/` | GitLab Duo Agent Platform flow (agentic layer). `red-gate-flow.yml` (supervisor + 6 sub-agents), `SCHEMA-NOTES.md` |
 
 ## Stack
 
@@ -45,6 +45,6 @@ CI variables: `GCP_PROJECT`, `GCP_REGION`, `GCP_SA_KEY` (`CI_REGISTRY*` are auto
 
 ## Known caveats
 
-- `redteam.py` treats a failed request (target down) as "held", so it fails open.
+- `redteam.py` fails closed: exit 0 pass, 1 breach, 2 target unreachable or 5xx (also blocks promotion).
 - The VULN-3 runtime probe never finds the key even on the baseline; static Secret
   Detection is what catches it.
